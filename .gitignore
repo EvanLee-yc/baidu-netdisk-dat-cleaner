@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# 编辑器
+.vscode/
+.idea/
+
+# 依赖与日志
+node_modules/
+*.log
+
+# 本地测试产物
+/tmp-*
