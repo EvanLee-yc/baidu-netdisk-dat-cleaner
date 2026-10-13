@@ -1,62 +1,112 @@
 // ==UserScript==
 // @name         百度网盘 .dat 视频批量清理器
 // @namespace    https://github.com/EvanLee-yc
-// @version      1.0.0
-// @description  递归遍历百度网盘全部目录（绕过网页搜索最多 500 条的限制），批量删除 .dat 格式的视频文件。默认试运行，不会直接删。
+// @version      1.1.0
+// @description  批量删除百度网盘里的 .dat 视频文件。v1.1 默认改用搜索接口 + 「搜索-删除-再搜索」循环，请求数从「目录数」降到「轮数」，比 v1.0 的全盘遍历快两个数量级；仍保留遍历模式用于获取完整清单。默认试运行。
 // @author       Evan
 // @match        https://pan.baidu.com/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
 //
-// 说明：
-// 1) 本脚本只调用网盘网页版自己就在用的接口（/api/list 与 /api/filemanager），
+// ─────────────────────────── v1.1 改了什么 ───────────────────────────
+// v1.0 用 /api/list 逐目录递归：请求数 ≈ 目录数量。
+//   如果你有 2 万个目录，就要发 2 万多次请求（每次还有节流），慢是必然的
+//   —— 慢的原因是「目录数量」，不是「文件数量」。
+//
+// v1.1 默认改成 /api/search 按关键词直接定位文件：
+//   一轮 = 几次搜索请求 + 几次删除请求，然后删完再搜，让下一批“露出来”。
+//   例：3000 个 .dat 文件，遍历法约 2 万次请求；搜索法约 60 次请求。
+//
+// 代价（必须知道）：搜索模式下列表是「删掉一批才露出下一批」的，
+//   所以**看不到完整清单**。要完整清单（用于人工核对）请切到遍历模式。
+//
+// 其他说明：
+// 1) 只调用网盘网页版自己在用的接口（/api/search、/api/list、/api/filemanager），
 //    复用当前登录态 Cookie，不涉及第三方登录、不上传任何数据。
-// 2) 删除动作走的是网页版同一个接口，被删文件会进入「回收站」，默认保留 10 天可恢复。
-// 3) 默认 dryRun = true：只扫描、只列清单、只统计体积，不删任何东西。
-//    确认清单没问题后，再把 CONFIG.dryRun 改成 false，或点面板上的「开始删除」。
-// 4) 可以直接装成油猴脚本，也可以整段复制到网盘页面的控制台里直接回车运行。
+// 2) 删除后文件进「回收站」，默认保留约 10 天可恢复。
+// 3) 默认 dryRun：只扫描、只列清单、只统计体积，不删任何东西。
+// 4) 油猴脚本和控制台粘贴两种用法都行（不依赖任何 GM_ API）。
 
 (function () {
   'use strict';
 
   // ======================= 配置区 =======================
   const CONFIG = {
-    // 起始目录，'/' 表示整个网盘。只想扫某个文件夹就写成 '/我的资源/video'
+    // ===== 工作模式 =====
+    // 'search' = 用搜索接口定位 .dat（快，默认）
+    // 'walk'   = 逐目录递归遍历（慢，但能得到完整清单，便于人工核对）
+    mode: 'search',
+
+    // 搜索关键词。'.dat' 更精确；如果搜不到东西就改成 'dat'
+    // （本地仍会按扩展名二次过滤，所以放宽关键词不会误删）
+    searchKey: '.dat',
+
+    // 搜索单页条数 / 单轮最多翻几页（5 × 100 = 500，与网页版搜索显示上限一致）
+    searchPageSize: 100,
+    searchMaxPages: 5,
+
+    // 搜索排序：'time' 或 'name'。若某个窗口反复卡在已删文件上，换个排序能看到不同结果
+    searchSort: 'time',
+
+    // 追加到 /api/search 上的额外查询参数。
+    // 用途：把搜索限定在某个分类里（例如网盘的「视频」分类）。
+    // 默认留空 —— 因为脚本已经用 category === 1 在本地做了等价过滤，
+    // 只删视频这件事不依赖这个参数。
+    // 如果你想让搜索窗口 100% 被视频占满（少跑几轮），可以这样填：
+    //   searchExtraParams: { category: '1' }
+    // 具体参数名以你自己浏览器的实际请求为准：
+    //   F12 → Network → 在「视频」分类里搜索一次 → 点开 /api/search 请求看参数。
+    searchExtraParams: {},
+
+    // 「搜索-删除-再搜索」的最大轮数
+    maxRounds: 200,
+
+    // 某一轮没有新命中时：等待多久（等搜索索引刷新）
+    noProgressWaitMs: 5000,
+
+    // 一轮删完后，等多久再开始下一轮搜索。给搜索索引一点刷新时间，少白跑一轮
+    postDeleteWaitMs: 3000,
+
+    // 兜底：当搜索窗口被「删不掉的文件」占满、彻底搜不动时，
+    // 是否自动切到遍历模式把剩下的收尾（遍历模式可能很慢，所以默认关闭）
+    autoFallbackToWalk: false,
+
+    // ===== 筛选规则 =====
+    // 起始目录，'/' 表示整个网盘（遍历模式的起点；搜索模式用 recursion=1 全盘搜）
     rootDir: '/',
 
     // 要清理的扩展名（不区分大小写）
     ext: '.dat',
 
-    // true = 只删网盘判定为「视频」的文件（接口返回 category === 1）
-    // 打开这个开关可以避免误删同名的非视频 .dat
+    // true = 只删网盘判定为「视频」的文件（返回字段 category === 1）
     onlyCategoryVideo: true,
 
-    // 体积下限（字节）。0 表示不限；设成 1024*1024 就是忽略小于 1MB 的
+    // 体积下限（字节）。0 表示不限
     minSize: 0,
 
-    // 路径黑名单：路径里包含任意一个字符串就跳过（防止扫到不想动的目录）
+    // 路径黑名单：路径里包含任意一个字符串就跳过
     excludePaths: [],
 
-    // 控制台调用 bdcl.run() 时的默认行为：true = 只扫描不删除（建议保持 true）。
-    // 注意：面板上的「开始删除」按钮是强制执行删除，不受这个开关限制，
-    //      但它一定会弹出确认框，把要删的数量和体积先报给你。
+    // true = 只扫描不删除（控制台调用 bdcl.run() 时的默认值；
+    //        面板上的「开始删除」是强制执行，但一定会弹确认框）
     dryRun: true,
 
-    // 单次删除请求携带的文件数。官方接口对单次数量有限制，
-    // 遇到「一次操作文件不可超过 100 个」会自动拆半重试，所以这里不用太保守
+    // ===== 删除参数 =====
+    // 单次删除请求携带的文件数。遇到「一次操作文件不可超过 100 个」会自动拆半重试
     batchSize: 100,
 
     // 每个删除批次之间的间隔（毫秒）。调太小容易触发风控
     batchDelayMs: 800,
 
-    // 列表接口单页条数，最大 1000（这就是绕开搜索 500 条上限的关键：按目录分页遍历）
+    // 单次运行最多删多少个（安全阀）
+    maxFilesPerRun: 50000,
+
+    // ===== 遍历模式参数 =====
+    // 列表接口单页条数，最大 1000
     pageSize: 1000,
 
-    // 一次运行最多删多少个，安全阀
-    maxDelete: 200000,
-
-    // 递归深度上限，防止异常目录结构导致死循环
+    // 递归深度上限
     maxDepth: 64,
 
     // 列表请求失败重试次数
@@ -65,15 +115,16 @@
     // 删除请求失败重试次数
     deleteRetry: 3,
 
-    // 删除任务轮询间隔（异步删除需要查任务状态）
+    // 异步删除的任务轮询间隔
     pollInterval: 3000,
 
-    // 是否显示悬浮控制面板（关掉就纯控制台输出）
+    // 是否显示悬浮面板
     showPanel: true,
   };
   // =====================================================
 
   const API_LIST = 'https://pan.baidu.com/api/list';
+  const API_SEARCH = 'https://pan.baidu.com/api/search';
   const API_FM = 'https://pan.baidu.com/api/filemanager';
   const API_TASK = 'https://pan.baidu.com/share/taskquery';
   const APP_ID = '250528';
@@ -88,17 +139,34 @@
     running: false,
     aborted: false,
     bdstoken: '',
+    mode: '',
+    rounds: 0,
+    apiCalls: 0,
+    startTs: 0,
     scannedDirs: 0,
     scannedFiles: 0,
-    matched: [],        // 命中的文件 {path, name, size, category}
+    matched: [],          // 累计命中的文件 {path, name, size, category}
     skippedByCategory: 0,
     deleted: [],
     deleteFailed: [],
     totalBytes: 0,
     stopReason: '',
+    starvation: false,     // 搜索窗口被「删不掉的文件」占满
   };
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function fmtSize(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+  }
+
+  function fmtDuration(ms) {
+    if (ms < 60000) return (ms / 1000).toFixed(1) + ' 秒';
+    return Math.floor(ms / 60000) + ' 分 ' + Math.round((ms % 60000) / 1000) + ' 秒';
+  }
 
   // ======================= 日志 / UI =======================
   const logEl = () => document.getElementById('bdcl-log');
@@ -117,7 +185,6 @@
       else if (level === 'ok') div.style.color = '#6bff9e';
       el.appendChild(div);
       el.scrollTop = el.scrollHeight;
-      // 防止日志过长卡顿
       while (el.childNodes.length > 800) el.removeChild(el.firstChild);
     }
   }
@@ -125,21 +192,22 @@
   function refreshStats() {
     const el = document.getElementById('bdcl-stats');
     if (!el) return;
+    const dur = state.startTs ? fmtDuration(Date.now() - state.startTs) : '—';
+    const rate = state.apiCalls && state.startTs
+      ? (state.apiCalls / Math.max(1, (Date.now() - state.startTs) / 1000)).toFixed(1)
+      : '—';
     el.innerHTML = `
-      已扫描目录：<b>${state.scannedDirs}</b>　文件：<b>${state.scannedFiles}</b><br>
+      模式：<b>${state.mode || CONFIG.mode}</b>　轮次：<b>${state.rounds}</b>　
+      API 请求：<b>${state.apiCalls}</b> 次（${rate}/秒）　耗时：<b>${dur}</b><br>
+      ${state.mode === 'walk'
+        ? `已扫描目录：<b>${state.scannedDirs}</b>　文件：<b>${state.scannedFiles}</b><br>`
+        : ''}
       命中 .dat：<b style="color:#ff7b72">${state.matched.length}</b> 个　
       合计 <b>${fmtSize(state.totalBytes)}</b><br>
-      因非视频跳过：<b>${state.skippedByCategory}</b><br>
+      因非视频跳过：<b>${state.skippedByCategory}</b>　
       已删除：<b style="color:#6bff9e">${state.deleted.length}</b>　
       失败：<b style="color:#ffd166">${state.deleteFailed.length}</b>
     `;
-  }
-
-  function fmtSize(n) {
-    if (n < 1024) return n + ' B';
-    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-    if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
-    return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
   }
 
   function buildPanel() {
@@ -147,14 +215,14 @@
     const p = document.createElement('div');
     p.id = 'bdcl-panel';
     p.style.cssText = `
-      position:fixed;right:16px;bottom:16px;z-index:999999;width:400px;
+      position:fixed;right:16px;bottom:16px;z-index:999999;width:420px;
       background:#1f2126;color:#e6e6e6;border:1px solid #3a3d44;border-radius:10px;
       font:12px/1.6 -apple-system,Menlo,monospace;box-shadow:0 8px 28px rgba(0,0,0,.5);
     `;
     p.innerHTML = `
       <div id="bdcl-head" style="padding:8px 10px;background:#2a2d34;border-radius:10px 10px 0 0;
            display:flex;justify-content:space-between;align-items:center;cursor:move;">
-        <span style="font-weight:600">百度网盘 .dat 清理器 <span style="color:#8b8f98">v1.0.0</span></span>
+        <span style="font-weight:600">百度网盘 .dat 清理器 <span style="color:#8b8f98">v1.1.0</span></span>
         <span>
           <button id="bdcl-min" style="background:none;border:none;color:#8b8f98;cursor:pointer">—</button>
           <button id="bdcl-close" style="background:none;border:none;color:#8b8f98;cursor:pointer">×</button>
@@ -162,19 +230,22 @@
       </div>
       <div id="bdcl-body" style="padding:10px">
         <div id="bdcl-stats" style="margin-bottom:8px;color:#c9ccd4"></div>
-        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+          <select id="bdcl-mode" class="bdcl-btn" style="padding:4px 6px">
+            <option value="search">搜索模式（快）</option>
+            <option value="walk">遍历模式（完整清单）</option>
+          </select>
           <button id="bdcl-scan"  class="bdcl-btn">试运行扫描</button>
           <button id="bdcl-del"   class="bdcl-btn">开始删除</button>
-          <button id="bdcl-print" class="bdcl-btn">打印删除清单</button>
+          <button id="bdcl-print" class="bdcl-btn">打印清单</button>
           <button id="bdcl-stop"  class="bdcl-btn">停止</button>
           <button id="bdcl-clear" class="bdcl-btn">清空日志</button>
         </div>
         <div style="color:#8b8f98;margin-bottom:4px">
-          起始目录 <b>${CONFIG.rootDir}</b>　扩展名 <b>${CONFIG.ext}</b>　
-          仅视频 <b>${CONFIG.onlyCategoryVideo}</b>　
-          批大小 <b>${CONFIG.batchSize}</b>
+          起始目录 <b>${CONFIG.rootDir}</b>　关键词 <b>${CONFIG.searchKey}</b>　
+          扩展名 <b>${CONFIG.ext}</b>　仅视频 <b>${CONFIG.onlyCategoryVideo}</b>
         </div>
-        <div id="bdcl-log" style="height:180px;overflow:auto;background:#16181c;border:1px solid #2f323a;
+        <div id="bdcl-log" style="height:190px;overflow:auto;background:#16181c;border:1px solid #2f323a;
              border-radius:6px;padding:6px;white-space:pre-wrap;word-break:break-all"></div>
       </div>
     `;
@@ -186,6 +257,11 @@
       .bdcl-btn:hover{background:#3a3e48}.bdcl-btn:disabled{opacity:.45;cursor:not-allowed}`;
     document.head.appendChild(st);
 
+    const modeSel = document.getElementById('bdcl-mode');
+    if (modeSel) {
+      modeSel.value = CONFIG.mode;
+      modeSel.onchange = () => { CONFIG.mode = modeSel.value; refreshStats(); };
+    }
     document.getElementById('bdcl-scan').onclick = () => run(true);
     document.getElementById('bdcl-del').onclick = () => run(false);
     document.getElementById('bdcl-print').onclick = printList;
@@ -203,7 +279,6 @@
     };
     document.getElementById('bdcl-close').onclick = () => p.remove();
 
-    // 简单拖动
     let drag = null;
     const head = document.getElementById('bdcl-head');
     head.onmousedown = (e) => {
@@ -223,18 +298,22 @@
   }
 
   function setButtons(disabled) {
-    ['bdcl-scan', 'bdcl-del', 'bdcl-print'].forEach((id) => {
+    ['bdcl-scan', 'bdcl-del', 'bdcl-print', 'bdcl-mode'].forEach((id) => {
       const b = document.getElementById(id);
       if (b) b.disabled = disabled;
     });
   }
 
+  // ======================= 带计数的请求 =======================
+  async function apiFetch(url, opt) {
+    state.apiCalls++;
+    return await fetch(url, opt);
+  }
+
   // ======================= 鉴权：拿 bdstoken =======================
-  // 网盘写操作需要 bdstoken（CSRF token）。按可靠性依次尝试三种来源。
   async function getBdstoken() {
     if (state.bdstoken) return state.bdstoken;
 
-    // 1) 页面全局 locals
     try {
       if (window.locals && typeof window.locals.get === 'function') {
         const t = window.locals.get('bdstoken');
@@ -242,20 +321,18 @@
       }
     } catch (e) { /* ignore */ }
 
-    // 2) 官方取模板变量接口
     try {
       const url = `https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id=${APP_ID}` +
         `&web=1&fields=${encodeURIComponent('["bdstoken"]')}`;
-      const r = await fetch(url, { credentials: 'include' });
+      const r = await apiFetch(url, { credentials: 'include' });
       const j = await r.json();
       if (j && j.errno === 0 && j.result && j.result.bdstoken) {
         return (state.bdstoken = j.result.bdstoken);
       }
     } catch (e) { /* ignore */ }
 
-    // 3) 抓主页 HTML 里的 locals.set('bdstoken', '...')
     try {
-      const r = await fetch('https://pan.baidu.com/disk/home', { credentials: 'include' });
+      const r = await apiFetch('https://pan.baidu.com/disk/home', { credentials: 'include' });
       const html = await r.text();
       const m = html.match(/bdstoken['":\s]+([0-9a-f]{32})/);
       if (m) return (state.bdstoken = m[1]);
@@ -264,10 +341,232 @@
     return '';
   }
 
-  // ======================= 列表接口 =======================
-  // 关键点：这里按「目录 + 分页」遍历，而不是用网页搜索框。
-  // 网页搜索单次最多返回 500 条，而 /api/list 单页 num 最大 1000，
-  // 靠翻页可以拿到一个目录下的全部文件，再递归子目录即可覆盖整个网盘。
+  // ======================= 筛选规则 =======================
+  function checkFile(f) {
+    const name = f.server_filename || (f.path || '').split('/').pop() || '';
+    if (!name.toLowerCase().endsWith(CONFIG.ext.toLowerCase())) return { match: false, reason: 'ext' };
+    if ((f.size || 0) < CONFIG.minSize) return { match: false, reason: 'size' };
+    if (CONFIG.onlyCategoryVideo && f.category !== 1) return { match: false, reason: 'category' };
+    if (CONFIG.excludePaths.some((k) => (f.path || '').includes(k))) return { match: false, reason: 'exclude' };
+    return { match: true };
+  }
+
+  // ======================= 搜索模式 =======================
+  // GET /api/search?recursion=1&page=&num=&key=<关键词>
+  // 返回字段与 /api/list 完全一致（含 isdir / category），所以判定逻辑通用。
+  async function apiSearch(page) {
+    const qs = new URLSearchParams({
+      recursion: '1',
+      order: CONFIG.searchSort,
+      desc: '1',
+      showempty: '0',
+      web: '1',
+      page: String(page),
+      num: String(CONFIG.searchPageSize),
+      key: CONFIG.searchKey,
+      t: String(Date.now()),
+      channel: 'chunlei',
+      app_id: APP_ID,
+      bdstoken: state.bdstoken,
+      clienttype: '0',
+    });
+    // 追加用户配置的额外参数（例如把搜索限定到「视频」分类）
+    for (const [k, v] of Object.entries(CONFIG.searchExtraParams || {})) {
+      qs.set(k, String(v));
+    }
+    const res = await apiFetch(`${API_SEARCH}?${qs.toString()}`, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    return await res.json();
+  }
+
+  // 取一轮搜索结果：翻 searchMaxPages 页，按 path 去重。
+  // 返回 { items, full }：
+  //   full === true 表示「拿满了一整窗」，也就是搜索结果至少还有 pages × pageSize 条
+  //   （可能还有更多被 500 条窗口挡住）——用来区分「真的删完了」和「窗口被占满」。
+  async function collectSearchRound(isStale) {
+    const out = [];
+    const seen = new Set();
+    let full = false;
+    for (let page = 1; page <= CONFIG.searchMaxPages; page++) {
+      if (state.aborted) break;
+      let data = null;
+      for (let i = 1; i <= CONFIG.listRetry; i++) {
+        try {
+          data = await apiSearch(page);
+          if (data && (data.errno === 0 || data.errno === -9)) break;
+          if (data && data.errno === 112) {
+            log('bdstoken 已过期，重新获取…', 'warn');
+            state.bdstoken = '';
+            await getBdstoken();
+            continue;
+          }
+          if (data && data.errno === -6) {
+            log('登录态已失效，请刷新页面重新登录。', 'err');
+            state.stopReason = '登录态失效';
+            state.aborted = true;
+            return null;
+          }
+          log(`搜索失败 page=${page} errno=${data && data.errno}（第 ${i} 次）`, 'warn');
+        } catch (e) {
+          log(`搜索异常 page=${page}：${e.message}（第 ${i} 次）`, 'warn');
+        }
+        await sleep(600 * i);
+      }
+      if (!data) { log(`搜索请求放弃（page=${page}）`, 'err'); break; }
+      if (data.errno !== 0) { log(`搜索返回 errno=${data.errno}：${data.errmsg || ''}`, 'err'); break; }
+
+      const list = (data.list || []).filter((f) => !f.isdir);
+      for (const f of list) {
+        if (!seen.has(f.path)) { seen.add(f.path); out.push(f); }
+      }
+      if (list.length < CONFIG.searchPageSize) { full = false; break; }
+      full = true;   // 这一页是满的 → 结果可能还有更多
+
+      // 省流优化：第 1 页全是「刚刚删过的」文件时，说明索引还没刷新，
+      // 后面几页大概率也是同一批，不必翻，省下几次请求，直接进入等待。
+      if (page === 1 && isStale && list.every((f) => isStale(f.path))) {
+        log('第 1 页全是刚删过的文件（索引尚未刷新），本轮不再翻页。', 'warn');
+        break;
+      }
+      await sleep(150);
+    }
+    return { items: out, full };
+  }
+
+  // 「搜索 → 筛选 → 删除 → 再搜索」循环
+  async function runSearchMode(dry) {
+    const deletedSet = new Set();     // 已确认删掉的路径（权威的“做完了”集合）
+    const matchedSet = new Set();     // 只用于清单去重显示
+    const skippedSet = new Set();     // 已计过数的“非视频”路径，避免每轮重复累加
+    let round = 0;
+    let idleStreak = 0;
+    let zeroDeleteStreak = 0;
+
+    while (!state.aborted && round < CONFIG.maxRounds) {
+      round++;
+      state.rounds = round;
+
+      const res = await collectSearchRound((p) => deletedSet.has(p));
+      if (res === null) break;
+      const items = res.items;
+      const roundFull = res.full;
+
+      const hits = [];
+      for (const f of items) {
+        const v = checkFile(f);
+        if (v.match) hits.push(f);
+        else if (v.reason === 'category' && !skippedSet.has(f.path)) {
+          skippedSet.add(f.path);
+          state.skippedByCategory++;
+        }
+      }
+
+      // fresh = 还没被删掉的（删除失败的下一轮会被重试）
+      const fresh = hits.filter((f) => !deletedSet.has(f.path));
+      log(`第 ${round} 轮：搜索返回 ${items.length} 条 → 命中 ${hits.length} 个 → 新文件 ${fresh.length} 个` +
+        `（API 请求累计 ${state.apiCalls} 次）`);
+      refreshStats();
+
+      if (!fresh.length) {
+        // 关键判别：结果已经不足一整窗 → 说明搜索把全部结果都给了我们，确实删完了
+        if (!roundFull) {
+          log('搜索结果已不足一整窗且没有新文件 → 确认清理完毕。', 'ok');
+          break;
+        }
+        idleStreak++;
+        // 阶梯式自救：等索引 → 换排序 → 判定「窗口被占满」
+        // （刻意不做「加深分页」这一步：接口超出真实上限后会返回空页，
+        //   看起来就像「结果已经取完」，会把「窗口被占满」误判成「已清理完毕」。）
+        if (idleStreak === 1) {
+          log(`本轮没有新命中，等 ${Math.round(CONFIG.noProgressWaitMs / 1000)} 秒等搜索索引刷新…`, 'warn');
+          await sleep(CONFIG.noProgressWaitMs);
+          continue;
+        }
+        if (idleStreak === 2) {
+          CONFIG.searchSort = CONFIG.searchSort === 'name' ? 'time' : 'name';
+          log(`仍然没有新命中，把搜索排序换成 ${CONFIG.searchSort}，换个结果窗口再看…`, 'warn');
+          await sleep(1000);
+          continue;
+        }
+        if (idleStreak === 3) {
+          log('搜索窗口里已经没有新的可删文件了。', 'err');
+          log('原因通常是：命中结果里混着一批「删不掉的文件」（比如非视频的 .dat），', 'err');
+          log('它们把搜索窗口的前排占满了，后面的文件就永远露不出来。', 'err');
+          log('建议：① 把 CONFIG.searchExtraParams 填成视频分类参数（对着 F12 里的 /api/search 请求抄）；', 'err');
+          log('      ② 或把 CONFIG.autoFallbackToWalk 设为 true，自动用遍历模式收尾；', 'err');
+          log('      ③ 或直接用遍历模式跑一遍。', 'err');
+          state.stopReason = '搜索窗口被不可删除的文件占满';
+          state.starvation = true;
+          break;
+        }
+      }
+      idleStreak = 0;
+
+      for (const f of fresh) {
+        if (!matchedSet.has(f.path)) {
+          matchedSet.add(f.path);
+          state.matched.push({
+            path: f.path,
+            name: f.server_filename || f.path.split('/').pop(),
+            size: f.size || 0,
+            category: f.category,
+          });
+          state.totalBytes += f.size || 0;
+        }
+      }
+
+      if (dry) {
+        log('试运行：只看第 1 轮，没有删除任何文件。', 'warn');
+        log('注意：搜索模式是「删掉一批才露出下一批」，所以看不到完整清单；', 'warn');
+        log('       要完整清单请把模式切到「遍历模式（完整清单）」再扫描。', 'warn');
+        break;
+      }
+
+      if (state.deleted.length >= CONFIG.maxFilesPerRun) {
+        log(`已达 maxFilesPerRun=${CONFIG.maxFilesPerRun}，停止。`, 'warn');
+        break;
+      }
+
+      const before = state.deleted.length;
+      const paths = fresh.map((f) => f.path);
+      for (let i = 0; i < paths.length; i += CONFIG.batchSize) {
+        if (state.aborted) break;
+        const batch = paths.slice(i, i + CONFIG.batchSize);
+        log(`第 ${round} 轮：删除 ${i + 1}~${Math.min(i + CONFIG.batchSize, paths.length)} / ${paths.length}` +
+          `（累计已删 ${state.deleted.length}）`);
+        await doDelete(batch);
+        await sleep(CONFIG.batchDelayMs);
+      }
+
+      // 只把「确实删成功」的路径记进 deletedSet
+      for (const p of state.deleted) deletedSet.add(p);
+
+      if (state.deleted.length === before) {
+        zeroDeleteStreak++;
+        if (zeroDeleteStreak > 3) {
+          log('连续多轮一个都没删成功，停止（避免空转）。请检查日志里的 errno。', 'err');
+          state.stopReason = '连续多轮删除全部失败';
+          break;
+        }
+      } else {
+        zeroDeleteStreak = 0;
+      }
+
+      await sleep(CONFIG.postDeleteWaitMs);
+    }
+
+    if (round >= CONFIG.maxRounds) {
+      log(`已达 maxRounds=${CONFIG.maxRounds}，停止（可能还有剩余文件，可再次运行）。`, 'warn');
+    }
+    if (state.stopReason) log(`停止原因：${state.stopReason}`, 'err');
+  }
+
+  // ======================= 遍历模式 =======================
+  // GET /api/list?dir=&page=&num=1000 —— 单页 1000，翻页直到不足一页；
+  // 再对子目录递归。请求数 ≈ 目录数量，慢但能得到完整清单。
   async function apiList(dir, page) {
     const qs = new URLSearchParams({
       order: 'time',
@@ -283,7 +582,7 @@
       bdstoken: state.bdstoken,
       clienttype: '0',
     });
-    const res = await fetch(`${API_LIST}?${qs.toString()}`, {
+    const res = await apiFetch(`${API_LIST}?${qs.toString()}`, {
       method: 'GET',
       credentials: 'include',
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -291,7 +590,7 @@
     return await res.json();
   }
 
-  async function listAllOfDir(dir, depth) {
+  async function listAllOfDir(dir) {
     const all = [];
     let page = 1;
     for (;;) {
@@ -301,6 +600,18 @@
         try {
           data = await apiList(dir, page);
           if (data && (data.errno === 0 || data.errno === -9)) break;
+          if (data && data.errno === 112) {
+            log('bdstoken 已过期，重新获取…', 'warn');
+            state.bdstoken = '';
+            await getBdstoken();
+            continue;
+          }
+          if (data && data.errno === -6) {
+            log('登录态已失效，请刷新页面重新登录。', 'err');
+            state.stopReason = '登录态失效';
+            state.aborted = true;
+            return null;
+          }
           log(`列表失败 ${dir} page=${page} errno=${data && data.errno}（第 ${i} 次）`, 'warn');
         } catch (e) {
           log(`列表异常 ${dir} page=${page}：${e.message}（第 ${i} 次）`, 'warn');
@@ -308,37 +619,26 @@
         await sleep(600 * i);
       }
       if (!data) { log(`放弃该目录：${dir}`, 'err'); break; }
-
-      if (data.errno === 112) {
-        // 页面已过期，通常是 bdstoken 失效，刷新后重试一次
-        log('bdstoken 已过期，重新获取…', 'warn');
-        state.bdstoken = '';
-        await getBdstoken();
-        continue;
-      }
-      if (data.errno === -6) {
-        log('登录态已失效，请刷新页面重新登录。', 'err');
-        state.stopReason = '登录态失效';
-        state.aborted = true;
-        break;
-      }
-      if (data.errno === -9) break; // 目录已被删除
-      if (data.errno !== 0) {
-        log(`列表返回 errno=${data.errno}：${data.errmsg || ''}`, 'err');
-        break;
-      }
+      if (data.errno === -9) break;
+      if (data.errno !== 0) { log(`列表返回 errno=${data.errno}：${data.errmsg || ''}`, 'err'); break; }
 
       const list = data.list || [];
       all.push(...list);
       if (list.length < CONFIG.pageSize) break;
       page++;
-      await sleep(150); // 轻微节流，别把接口打爆
+      await sleep(150);
     }
     return all;
   }
 
-  async function walk(root) {
-    const queue = [{ dir: root, depth: 0 }];
+  async function runWalkMode(dry) {
+    const queue = [{ dir: CONFIG.rootDir, depth: 0 }];
+    // 从已有清单起步，避免和搜索模式的结果重复计数
+    const matchedSet = new Set(state.matched.map((x) => x.path));
+    // 本次遍历真正发现的文件。删除时只删这一批 ——
+    // 不能拿 state.matched 去删，那里面含搜索阶段已经删过的路径，会被重复计入。
+    const walkFound = [];
+
     while (queue.length) {
       if (state.aborted) break;
       const { dir, depth } = queue.shift();
@@ -346,7 +646,8 @@
         log(`递归超过 ${CONFIG.maxDepth} 层，跳过：${dir}`, 'warn');
         continue;
       }
-      const items = await listAllOfDir(dir, depth);
+      const items = await listAllOfDir(dir);
+      if (items === null) break;
       state.scannedDirs++;
       let hitHere = 0;
 
@@ -361,37 +662,63 @@
         state.scannedFiles++;
         const v = checkFile(f);
         if (v.match) {
-          state.matched.push({
-            path: f.path,
-            name: f.server_filename || f.path.split('/').pop(),
-            size: f.size || 0,
-            category: f.category,
-          });
-          state.totalBytes += f.size || 0;
+          walkFound.push(f.path);
+          if (!matchedSet.has(f.path)) {
+            matchedSet.add(f.path);
+            state.matched.push({
+              path: f.path,
+              name: f.server_filename || f.path.split('/').pop(),
+              size: f.size || 0,
+              category: f.category,
+            });
+            state.totalBytes += f.size || 0;
+          }
           hitHere++;
         } else if (v.reason === 'category') {
           state.skippedByCategory++;
         }
       }
 
-      log(`扫描 ${dir} → 子项 ${items.length}，命中 ${hitHere}，待处理目录 ${queue.length}`);
+      log(`扫描 ${dir} → 子项 ${items.length}，命中 ${hitHere}，待处理目录 ${queue.length}` +
+        `（API 请求累计 ${state.apiCalls} 次）`);
       refreshStats();
       await sleep(120);
     }
+
+    log(`扫描结束：目录 ${state.scannedDirs}，文件 ${state.scannedFiles}，` +
+      `命中 ${state.matched.length} 个（${fmtSize(state.totalBytes)}）`, 'ok');
+
+    if (!state.matched.length) { log('没有命中任何文件，无需删除。', 'ok'); return; }
+
+    if (dry) {
+      log('试运行模式：没有删除任何文件。请点「打印清单」核对，确认无误后再点「开始删除」。', 'warn');
+      return;
+    }
+
+    const ok = window.confirm(
+      `即将删除 ${state.matched.length} 个 .dat 文件，合计 ${fmtSize(state.totalBytes)}。\n\n` +
+      `删除后文件会进入「回收站」（约 10 天可恢复）。\n\n确定继续吗？`
+    );
+    if (!ok) { log('用户取消删除。', 'warn'); return; }
+
+    const targets = walkFound.slice(0, CONFIG.maxFilesPerRun);
+    if (targets.length < walkFound.length) {
+      log(`超过 maxFilesPerRun=${CONFIG.maxFilesPerRun}，本次只处理前 ${targets.length} 个。`, 'warn');
+    }
+    for (let i = 0; i < targets.length; i += CONFIG.batchSize) {
+      if (state.aborted) break;
+      const batch = targets.slice(i, i + CONFIG.batchSize);
+      log(`删除进度 ${i + 1}~${Math.min(i + CONFIG.batchSize, targets.length)} / ${targets.length}`);
+      await doDelete(batch);
+      await sleep(CONFIG.batchDelayMs);
+    }
+    log(`删除结束：成功 ${state.deleted.length}，失败 ${state.deleteFailed.length}`, 'ok');
+    if (state.stopReason) log(`停止原因：${state.stopReason}`, 'err');
   }
 
-  function checkFile(f) {
-    const name = f.server_filename || f.path.split('/').pop() || '';
-    if (!name.toLowerCase().endsWith(CONFIG.ext.toLowerCase())) return { match: false, reason: 'ext' };
-    if ((f.size || 0) < CONFIG.minSize) return { match: false, reason: 'size' };
-    if (CONFIG.onlyCategoryVideo && f.category !== 1) return { match: false, reason: 'category' };
-    return { match: true };
-  }
-
-  // ======================= 删除接口 =======================
+  // ======================= 删除 =======================
   // POST /api/filemanager?async=2&opera=delete&onnest=fail&...
   // body: filelist=<URL 编码的 JSON 数组>
-  // 返回 {errno:0, taskid:N}，随后轮询 /share/taskquery 等任务结束
   async function deleteBatch(paths) {
     const qs = new URLSearchParams({
       async: '2',
@@ -404,7 +731,7 @@
       clienttype: '0',
       'dp-logid': String(Date.now()) + '0000',
     });
-    const res = await fetch(`${API_FM}?${qs.toString()}`, {
+    const res = await apiFetch(`${API_FM}?${qs.toString()}`, {
       method: 'POST',
       credentials: 'include',
       headers: {
@@ -429,7 +756,7 @@
           bdstoken: state.bdstoken,
           clienttype: '0',
         });
-        const r = await fetch(`${API_TASK}?${qs.toString()}`, { credentials: 'include' });
+        const r = await apiFetch(`${API_TASK}?${qs.toString()}`, { credentials: 'include' });
         const j = await r.json();
         const status = (j && (j.status || (j.taskinfo && j.taskinfo[0] && j.taskinfo[0].status))) || '';
         if (status === 'success' || status === 'failed') return status;
@@ -439,7 +766,6 @@
     }
   }
 
-  // 真正的删除调度：自动拆批 + 遇到数量超限拆半重试
   async function doDelete(paths) {
     if (!paths.length) return;
     if (paths.length > CONFIG.batchSize) {
@@ -457,7 +783,6 @@
         const errno = j && j.errno;
 
         if (errno === 0) {
-          // 成功：异步任务需等它跑完，再进入下一批
           if (j.taskid) {
             const st = await pollTask(j.taskid);
             if (st === 'failed') log(`任务 ${j.taskid} 状态 failed（文件通常仍已删除）`, 'warn');
@@ -468,7 +793,6 @@
         }
 
         if (errno === 3) {
-          // 「一次操作文件不可超过 100 个」→ 拆半重试
           log(`单次数量超限，拆半重试（${paths.length} → ${Math.ceil(paths.length / 2)}）`, 'warn');
           const half = Math.ceil(paths.length / 2);
           await doDelete(paths.slice(0, half));
@@ -477,8 +801,7 @@
         }
 
         if (errno === -9) {
-          // 文件已不存在，视为成功
-          state.deleted.push(...paths);
+          state.deleted.push(...paths);   // 文件已不存在，视为已删
           refreshStats();
           return;
         }
@@ -520,13 +843,18 @@
   async function run(forceDry) {
     if (state.running) { log('已有任务在运行。', 'warn'); return; }
 
-    // 只有两种模式：forceDry === true 强制试运行；
-    // forceDry === false / undefined 时按 CONFIG.dryRun 决定。
-    // 面板上的「开始删除」传 false，所以它会真的删（并且一定弹确认框）。
-    const dry = forceDry === true ? true : CONFIG.dryRun;
+    // forceDry === true      → 强制试运行（面板「试运行扫描」按钮）
+    // forceDry === false     → 强制执行删除（面板「开始删除」按钮，一定会弹确认框）
+    // forceDry === undefined → 按 CONFIG.dryRun（控制台直接调 bdcl.run() 时）
+    const dry = forceDry === true ? true : (forceDry === false ? false : CONFIG.dryRun);
     state.running = true;
     state.aborted = false;
     state.stopReason = '';
+    state.starvation = false;
+    state.mode = CONFIG.mode;
+    state.rounds = 0;
+    state.apiCalls = 0;
+    state.startTs = Date.now();
     state.scannedDirs = 0;
     state.scannedFiles = 0;
     state.matched = [];
@@ -543,48 +871,39 @@
         log('拿不到 bdstoken，请确认已登录网盘并停留在 pan.baidu.com 页面上。', 'err');
         return;
       }
-      log(`bdstoken 获取成功，开始扫描 ${CONFIG.rootDir} …`, 'ok');
+      log(`bdstoken 获取成功。模式 = ${CONFIG.mode}` +
+        (CONFIG.mode === 'search' ? `，关键词 = "${CONFIG.searchKey}"` : `，起始目录 = ${CONFIG.rootDir}`), 'ok');
 
-      await walk(CONFIG.rootDir);
+      if (CONFIG.mode === 'search') {
+        if (!dry) {
+          const ok = window.confirm(
+            '搜索模式说明：脚本会「搜索一批 → 删除一批 → 再搜索」，逐轮推进，直到搜不到新文件。\n\n' +
+            '· 筛选规则：非目录 + 扩展名 ' + CONFIG.ext + ' + ' +
+            (CONFIG.onlyCategoryVideo ? '网盘判定为「视频」' : '不限制类型') + '\n' +
+            '· 删除后进回收站，约 10 天可恢复\n' +
+            '· 搜索模式看不到完整清单，要完整清单请用遍历模式\n\n确定开始吗？'
+          );
+          if (!ok) { log('用户取消。', 'warn'); return; }
+        }
+        await runSearchMode(dry);
 
-      log(`扫描结束：目录 ${state.scannedDirs}，文件 ${state.scannedFiles}，` +
-        `命中 ${state.matched.length} 个（${fmtSize(state.totalBytes)}）`, 'ok');
-      if (state.skippedByCategory) {
-        log(`另有 ${state.skippedByCategory} 个 .dat 因不是「视频」类型被跳过（可关闭 onlyCategoryVideo 纳入）。`, 'warn');
+        // 搜索窗口被占满时，可选地自动切到遍历模式收尾
+        if (state.starvation && CONFIG.autoFallbackToWalk && !state.aborted && !dry) {
+          log('自动切换到遍历模式，把搜索够不到的剩余文件收尾…', 'warn');
+          state.mode = 'walk';
+          state.starvation = false;
+          state.stopReason = '';
+          await runWalkMode(false);
+          state.mode = 'search';
+        }
+      } else {
+        await runWalkMode(dry);
       }
 
-      if (state.matched.length === 0) {
-        log('没有命中任何文件，无需删除。', 'ok');
-        return;
-      }
-
-      if (dry) {
-        log('试运行模式：没有删除任何文件。请点「打印删除清单」核对，确认无误后再点「开始删除」。', 'warn');
-        return;
-      }
-
-      // 二次确认
-      const ok = window.confirm(
-        `即将删除 ${state.matched.length} 个 .dat 文件，合计 ${fmtSize(state.totalBytes)}。\n\n` +
-        `删除后文件会进入「回收站」（约 10 天可恢复）。\n\n确定继续吗？`
-      );
-      if (!ok) { log('用户取消删除。', 'warn'); return; }
-
-      log(`开始删除 ${state.matched.length} 个文件，批大小 ${CONFIG.batchSize}，间隔 ${CONFIG.batchDelayMs}ms …`, 'warn');
-      const targets = state.matched.map((x) => x.path).slice(0, CONFIG.maxDelete);
-      if (targets.length < state.matched.length) {
-        log(`超过 maxDelete=${CONFIG.maxDelete}，本次只处理前 ${targets.length} 个。`, 'warn');
-      }
-
-      for (let i = 0; i < targets.length; i += CONFIG.batchSize) {
-        if (state.aborted) break;
-        const batch = targets.slice(i, i + CONFIG.batchSize);
-        log(`删除进度 ${i}/${targets.length} …`);
-        await doDelete(batch);
-        await sleep(CONFIG.batchDelayMs);
-      }
-      log(`删除结束：成功 ${state.deleted.length}，失败 ${state.deleteFailed.length}`, 'ok');
-      if (state.stopReason) log(`停止原因：${state.stopReason}`, 'err');
+      const echo = `本轮结束：命中 ${state.matched.length} 个（${fmtSize(state.totalBytes)}），` +
+        `已删 ${state.deleted.length}，失败 ${state.deleteFailed.length}，` +
+        `API 请求 ${state.apiCalls} 次，耗时 ${fmtDuration(Date.now() - state.startTs)}`;
+      log(echo, 'ok');
     } catch (e) {
       log(`运行出错：${e.message}`, 'err');
       console.error(e);
@@ -614,13 +933,12 @@
   }
 
   // ======================= 启动 =======================
-  // 暴露到控制台，方便手动调用
   window.bdcl = { CONFIG, state, run, printList, getBdstoken };
 
   function boot() {
     if (!CONFIG.showPanel) {
       log('已加载（面板已关闭）。控制台调用：bdcl.run() / bdcl.printList()');
-      console.log('[bdcl] 命令：bdcl.run() 扫描并删除；先改 bdcl.CONFIG.dryRun = false 才真删。');
+      console.log('[bdcl] 命令：bdcl.CONFIG.mode = "search" | "walk"；然后 bdcl.run()。');
       return;
     }
     let tries = 0;
@@ -637,5 +955,5 @@
     boot();
   }
 
-  console.log('[bdcl] 百度网盘 .dat 清理器已加载。默认只试运行，不会删文件。');
+  console.log('[bdcl] 百度网盘 .dat 清理器 v1.1.0 已加载。默认搜索模式、只试运行，不会删文件。');
 })();
