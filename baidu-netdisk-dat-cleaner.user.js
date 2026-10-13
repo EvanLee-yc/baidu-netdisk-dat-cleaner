@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百度网盘 .dat 视频批量清理器
 // @namespace    https://github.com/EvanLee-yc
-// @version      1.1.0
+// @version      1.1.1
 // @description  批量删除百度网盘里的 .dat 视频文件。v1.1 默认改用搜索接口 + 「搜索-删除-再搜索」循环，请求数从「目录数」降到「轮数」，比 v1.0 的全盘遍历快两个数量级；仍保留遍历模式用于获取完整清单。默认试运行。
 // @author       Evan
 // @match        https://pan.baidu.com/*
@@ -27,6 +27,9 @@
 // 2) 删除后文件进「回收站」，默认保留约 10 天可恢复。
 // 3) 默认 dryRun：只扫描、只列清单、只统计体积，不删任何东西。
 // 4) 油猴脚本和控制台粘贴两种用法都行（不依赖任何 GM_ API）。
+// 5) 批量删除会被网盘风控拦下并要求「验证身份」（errno 132，一般是手机短信验证码）。
+//    脚本不会去绕过它，遇到就停下并在日志里列出 4 个验证入口；
+//    你手动过完验证后再点一次「开始删除」即接着删。
 
 (function () {
   'use strict';
@@ -222,7 +225,7 @@
     p.innerHTML = `
       <div id="bdcl-head" style="padding:8px 10px;background:#2a2d34;border-radius:10px 10px 0 0;
            display:flex;justify-content:space-between;align-items:center;cursor:move;">
-        <span style="font-weight:600">百度网盘 .dat 清理器 <span style="color:#8b8f98">v1.1.0</span></span>
+        <span style="font-weight:600">百度网盘 .dat 清理器 <span style="color:#8b8f98">v1.1.1</span></span>
         <span>
           <button id="bdcl-min" style="background:none;border:none;color:#8b8f98;cursor:pointer">—</button>
           <button id="bdcl-close" style="background:none;border:none;color:#8b8f98;cursor:pointer">×</button>
@@ -814,8 +817,19 @@
         }
 
         if (errno === 132) {
-          log('❗ 网盘要求「删除文件需要验证您的身份」，已自动停止。请到网页上手动验证一次身份后再运行。', 'err');
-          state.stopReason = '需要身份验证 (errno 132)';
+          // 网盘风控：批量删除要过身份验证（一般是手机短信验证码）。
+          // 验证框由网页版前端弹出，直接调接口只会拿到这个错误码，
+          // 没有任何可编程的验证入口 —— 所以脚本只能停下，绝不尝试绕过。
+          log('❗ 网盘要求「删除文件需要验证您的身份」，已自动停止。', 'err');
+          log('   这个验证框只会出现在网页版界面上，接口调用拿不到，必须手动过一次。', 'err');
+          log('   验证入口（任选一个）：', 'err');
+          log('     A. 网页版随便勾选一个文件 → 点「删除」→ 弹出提示后点「立即验证」→ 输短信验证码', 'err');
+          log('     B. 左侧「回收站」→ 右上角「清空」→ 点「立即验证」→ 输短信验证码', 'err');
+          log('     C. 手机百度网盘 App：我的 → 回收站 → 清空 → 立即验证', 'err');
+          log('     D. 电脑客户端：头像 → 个人中心 → 账号管理 → 身份验证 → 用手机 App 扫码', 'err');
+          log('   验证通过后，直接再点一次「开始删除」就能接着删（已删的不会重复删）。', 'err');
+          log('   想少被拦：把 batchSize 调小（如 20）、batchDelayMs 调大（如 5000）。', 'err');
+          state.stopReason = '需要身份验证 (errno 132)：请在网页版手动过一次验证，再点「开始删除」继续';
           state.aborted = true;
           return;
         }
@@ -955,5 +969,5 @@
     boot();
   }
 
-  console.log('[bdcl] 百度网盘 .dat 清理器 v1.1.0 已加载。默认搜索模式、只试运行，不会删文件。');
+  console.log('[bdcl] 百度网盘 .dat 清理器 v1.1.1 已加载。默认搜索模式、只试运行，不会删文件。');
 })();
